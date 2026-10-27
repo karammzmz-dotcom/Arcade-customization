@@ -6,14 +6,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.VibratorManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -48,6 +54,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DragIndicator
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -59,6 +67,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ToggleFloatingActionButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -66,6 +75,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,8 +95,6 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.arthur.arcade.firewall.PermissionManager
-import com.arthur.arcade.firewall.ShizukuManager
-import com.arthur.arcade.firewall.ShizukuState
 import com.arthur.arcade.firewall.VpnHandler
 import com.arthur.arcade.firewall.VpnHandlerImpl
 import com.arthur.arcade.ui.components.CheckPermissions
@@ -98,7 +107,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import rikka.shizuku.Shizuku
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import java.io.File
@@ -129,12 +137,6 @@ class MainActivity : ComponentActivity(), VpnHandler by VpnHandlerImpl() {
 		super.onCreate(savedInstanceState)
 		enableEdgeToEdge()
 		initVpnHandler(this)
-		ShizukuManager.bind(this)
-
-		Shizuku.addRequestPermissionResultListener { _, grantResult ->
-			PermissionManager.onShizukuPermissionResult(grantResult == PackageManager.PERMISSION_GRANTED)
-		}
-
 		setContent {
 			ArcadeTheme {
 				Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -153,17 +155,16 @@ class MainActivity : ComponentActivity(), VpnHandler by VpnHandlerImpl() {
 							Modifier.padding(innerPadding),
 							onContinue = {
 								checkPermissions = true
-								showOnboarding = false
 							}
 						)
-					} else {
 						if (checkPermissions){
 							CheckPermissions(context) {
+								showOnboarding = false
 								checkPermissions = false
 								SettingsRepository.setHasSeenOnboarding(context)
-								ShizukuManager.bind(context)
 							}
 						}
+					} else {
 						Home(Modifier.padding(innerPadding))
 					}
 				}
@@ -174,12 +175,6 @@ class MainActivity : ComponentActivity(), VpnHandler by VpnHandlerImpl() {
 	override fun onResume() {
 		super.onResume()
 		PermissionManager.refresh(this)
-	}
-
-	override fun onDestroy() {
-		super.onDestroy()
-		ShizukuManager.disableFirewall()
-		ShizukuManager.unbind()
 	}
 }
 
@@ -204,6 +199,10 @@ data class GameApp(
 
 	fun resolveProfile(profile: GameProfile): GameApp {
 		return this.copy(profile = profile)
+	}
+
+	fun resolveIcon(customIcon: Drawable?): GameApp {
+		return if (customIcon == null) this else this.copy(icon = customIcon)
 	}
 }
 
@@ -282,6 +281,26 @@ fun Home(modifier: Modifier = Modifier) {
 	var showAddAppSheet by remember { mutableStateOf(false) }
 	var showDeleteButton by remember { mutableStateOf(false) }
 	var showDraggableButton by remember { mutableStateOf(false) }
+	var showIconButton by remember { mutableStateOf(false) }
+
+	var iconDialogFor by remember { mutableStateOf<GameApp?>(null) }
+	var iconPickerTarget by rememberSaveable { mutableStateOf<String?>(null) }
+	var customIcons by remember { mutableStateOf(loadCustomIcons(context)) }
+	val iconScope = rememberCoroutineScope()
+	val iconPicker = rememberLauncherForActivityResult(
+		ActivityResultContracts.PickVisualMedia()
+	) { uri: Uri? ->
+		val pkg = iconPickerTarget
+		if (uri != null && pkg != null) {
+			iconScope.launch {
+				val saved = withContext(Dispatchers.IO) { saveCustomIcon(context, pkg, uri) }
+				if (saved != null) {
+					SettingsRepository.saveCustomIconPath(context, pkg, saved.first)
+					customIcons = customIcons + (pkg to BitmapDrawable(context.resources, saved.second))
+				}
+			}
+		}
+	}
 
 	var isAnyItemDragging by remember { mutableStateOf(false) }
 	var wasDragging by remember { mutableStateOf(false) }
@@ -345,6 +364,7 @@ fun Home(modifier: Modifier = Modifier) {
 
 	BackHandler(showDeleteButton) { showDeleteButton = false }
 	BackHandler(showDraggableButton) { showDraggableButton = false }
+	BackHandler(showIconButton) { showIconButton = false }
 
 	Box(Modifier.fillMaxSize()) {
 		Column(
@@ -466,10 +486,19 @@ fun Home(modifier: Modifier = Modifier) {
 													context,
 													gameOrNull.packageName
 												)
-											),
+											)
+											.resolveIcon(customIcons[gameOrNull.packageName]),
 
 										iconButton = @Composable {
 											when {
+												showIconButton -> {
+													IconButton(onClick = { iconDialogFor = gameOrNull }) {
+														Icon(
+															Icons.Default.Edit,
+															contentDescription = "Change icon"
+														)
+													}
+												}
 												showDraggableButton -> {
 													IconButton(
 														modifier = Modifier.draggableHandle(
@@ -496,12 +525,6 @@ fun Home(modifier: Modifier = Modifier) {
 																gameOrNull.packageName
 															)
 															games = getGames(context)
-															spacerIndices = (spacerIndices ?: emptyList())
-																.map {
-																	if (it >= rawGameIndex) it - 1
-																	else it
-																}
-																.distinct().filter { it in 0 until games.lastIndex }.sorted()
 														},
 													) {
 														Icon(
@@ -539,7 +562,7 @@ fun Home(modifier: Modifier = Modifier) {
 											!isGroupExpanded && !showDeleteButton && !showDraggableButton
 										),
 
-										enabled = !showDeleteButton && !showDraggableButton &&
+										slideEnabled = !showDeleteButton && !showDraggableButton && !showIconButton &&
 												(slidePermission == null || slidePermission == gameOrNull.packageName),
 
 
@@ -580,24 +603,21 @@ fun Home(modifier: Modifier = Modifier) {
 			BackHandler(expanded) { expanded = false }
 
 			FloatingActionButtonMenu(
-				expanded = expanded,
+				expanded = expanded && !showDeleteButton && !showIconButton,
 				button = {
 					ToggleFloatingActionButton(
-						checked = expanded,
+						checked = if (showDeleteButton || showIconButton) false else expanded,
 						onCheckedChange = { checked ->
 							if (showDeleteButton) {
 								showDeleteButton = false
-								SettingsRepository.setCustomOrder(
-									context,
-									games.map { it.packageName })
-								SettingsRepository.setIndices(context, spacerIndices ?: emptyList())
-
+							} else if (showIconButton) {
+								showIconButton = false
 							} else if (showDraggableButton) {
 								showDraggableButton = false
 								SettingsRepository.setCustomOrder(
 									context,
 									games.map { it.packageName })
-								SettingsRepository.setIndices(context, spacerIndices ?: emptyList())
+								SettingsRepository.setIndices(context, spacerIndices ?: listOf())
 							} else {
 								expanded = checked
 							}
@@ -606,11 +626,12 @@ fun Home(modifier: Modifier = Modifier) {
 						Icon(
 							imageVector = when {
 								showDeleteButton -> Icons.Default.Done
+								showIconButton -> Icons.Default.Done
 								showDraggableButton -> Icons.Default.Done
 								expanded -> Icons.Default.Close
 								else -> Icons.Default.Add
 							},
-							contentDescription = if (showDeleteButton) "Done" else "Menu Toggle",
+							contentDescription = if (showDeleteButton || showIconButton) "Done" else "Menu Toggle",
 							tint = if (expanded && !showDeleteButton) {
 								MaterialTheme.colorScheme.onPrimary
 							} else {
@@ -620,47 +641,92 @@ fun Home(modifier: Modifier = Modifier) {
 					}
 				}
 			) {
-				FloatingActionButtonMenuItem(
-					onClick = {
-						showDraggableButton = true
-						expanded = false
-					},
-					text = { Text("Organise Games") },
-					icon = {
-						Icon(
-							Icons.Default.DragIndicator,
-							contentDescription = "Drag Indicator"
-						)
-					}
-				)
-				FloatingActionButtonMenuItem(
-					onClick = {
-						showDeleteButton = true
-						expanded = false
-					},
-					text = { Text("Remove Game") },
-					icon = {
-						Icon(
-							Icons.Default.Delete,
-							contentDescription = "Delete"
-						)
-					}
-				)
-				FloatingActionButtonMenuItem(
-					onClick = {
-						showAddAppSheet = true
-						expanded = false
-					},
-					text = { Text("Add Game") },
-					icon = {
-						Icon(
-							Icons.Default.Add,
-							contentDescription = "Add"
-						)
-					}
-				)
+				if (!showDeleteButton) {
+					FloatingActionButtonMenuItem(
+						onClick = {
+							showDraggableButton = true
+							expanded = false
+						},
+						text = { Text("Organise Games") },
+						icon = {
+							Icon(
+								Icons.Default.DragIndicator,
+								contentDescription = "Drag Indicator"
+							)
+						}
+					)
+					FloatingActionButtonMenuItem(
+						onClick = {
+							showDeleteButton = true
+							expanded = false
+						},
+						text = { Text("Remove Game") },
+						icon = {
+							Icon(
+								Icons.Default.Delete,
+								contentDescription = "Delete"
+							)
+						}
+					)
+					FloatingActionButtonMenuItem(
+						onClick = {
+							showIconButton = true
+							expanded = false
+						},
+						text = { Text("Change Icons") },
+						icon = {
+							Icon(
+								Icons.Default.Edit,
+								contentDescription = "Edit"
+							)
+						}
+					)
+					FloatingActionButtonMenuItem(
+						onClick = {
+							showAddAppSheet = true
+							expanded = false
+						},
+						text = { Text("Add Game") },
+						icon = {
+							Icon(
+								Icons.Default.Add,
+								contentDescription = "Add"
+							)
+						}
+					)
+				}
 			}
 		}
+	}
+
+	iconDialogFor?.let { target ->
+		AlertDialog(
+			onDismissRequest = { iconDialogFor = null },
+			title = {
+				Text(SettingsRepository.loadName(context, target.packageName) ?: target.name)
+			},
+			text = { Text("Choose an image to use as this game's icon.") },
+			confirmButton = {
+				TextButton(onClick = {
+					iconPickerTarget = target.packageName
+					iconDialogFor = null
+					iconPicker.launch(
+						PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+					)
+				}) { Text("Choose image") }
+			},
+			dismissButton = {
+				if (customIcons.containsKey(target.packageName)) {
+					TextButton(onClick = {
+						SettingsRepository.loadCustomIconPath(context, target.packageName)
+							?.let { File(it).delete() }
+						SettingsRepository.saveCustomIconPath(context, target.packageName, null)
+						customIcons = customIcons - target.packageName
+						iconDialogFor = null
+					}) { Text("Reset") }
+				}
+			}
+		)
 	}
 
 	if (showAddAppSheet) {
@@ -958,6 +1024,31 @@ object SettingsRepository {
 		)
 	}
 
+	fun loadCustomIconPath(context: Context, packageName: String): String? {
+		val entry = loadFile(context).optJSONObject(packageName) ?: return null
+		val path = entry.optString("customIcon", "")
+		return if (path.isNotEmpty() && File(path).exists()) path else null
+	}
+
+	fun loadAllCustomIconPaths(context: Context): Map<String, String> {
+		val root = loadFile(context)
+		val result = mutableMapOf<String, String>()
+		root.keys().forEach { key ->
+			val entry = root.optJSONObject(key) ?: return@forEach
+			val path = entry.optString("customIcon", "")
+			if (path.isNotEmpty() && File(path).exists()) result[key] = path
+		}
+		return result
+	}
+
+	fun saveCustomIconPath(context: Context, packageName: String, path: String?) {
+		val root = loadFile(context)
+		val entry = root.optJSONObject(packageName) ?: JSONObject()
+		if (path != null) entry.put("customIcon", path) else entry.remove("customIcon")
+		root.put(packageName, entry)
+		saveFile(context, root)
+	}
+
 	fun saveName(context: Context, packageName: String, name: String) {
 		val root = loadFile(context)
 		val entry = root.optJSONObject(packageName) ?: JSONObject()
@@ -1072,14 +1163,6 @@ object SettingsRepository {
 		saveFile(context, root)
 	}
 
-	fun loadAllBlockedPackages(context: Context): List<String> {
-		val root = loadFile(context)
-		return root.keys().asSequence()
-			.filter { it.contains(".") }
-			.filter { root.optJSONObject(it)?.optBoolean("blockInternet", false) == true }
-			.toList()
-	}
-
 	private fun JSONArray.indexOfString(target: String): Int {
 		for (i in 0 until this.length()) {
 			if (this.optString(i) == target) {
@@ -1102,11 +1185,48 @@ fun applyProfile(context: Context, game: GameApp) {
 		}
 	}
 
-	if (PermissionManager.shizukuState.value != ShizukuState.Ready) {
-		if (game.profile.blockInternet) {
-			if (context is VpnHandler) {
-				context.checkAndStartVpn(game.packageName)
-			}
+	if (game.profile.blockInternet) {
+		if (context is VpnHandler) {
+			context.checkAndStartVpn(game.packageName)
 		}
+	}
+}
+
+fun loadCustomIcons(context: Context): Map<String, Drawable> {
+	return SettingsRepository.loadAllCustomIconPaths(context).mapNotNull { (pkg, path) ->
+		BitmapFactory.decodeFile(path)?.let { pkg to BitmapDrawable(context.resources, it) }
+	}.toMap()
+}
+
+/**
+ * Copies the picked image into app storage as a center-cropped, downscaled PNG.
+ * Returns the file path and decoded bitmap, or null on failure.
+ */
+fun saveCustomIcon(context: Context, packageName: String, uri: Uri): Pair<String, Bitmap>? {
+	return try {
+		val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+		context.contentResolver.openInputStream(uri)?.use {
+			BitmapFactory.decodeStream(it, null, bounds)
+		}
+		var sample = 1
+		while (bounds.outWidth / (sample * 2) >= 512 && bounds.outHeight / (sample * 2) >= 512) {
+			sample *= 2
+		}
+		val decoded = context.contentResolver.openInputStream(uri)?.use {
+			BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+		} ?: return null
+
+		val side = minOf(decoded.width, decoded.height)
+		val square = Bitmap.createBitmap(
+			decoded, (decoded.width - side) / 2, (decoded.height - side) / 2, side, side
+		)
+
+		val dir = File(context.filesDir, "icons").apply { mkdirs() }
+		dir.listFiles { f -> f.name.startsWith("$packageName-") }?.forEach { it.delete() }
+		val file = File(dir, "$packageName-${System.currentTimeMillis()}.png")
+		file.outputStream().use { square.compress(Bitmap.CompressFormat.PNG, 100, it) }
+		file.absolutePath to square
+	} catch (_: Exception) {
+		null
 	}
 }
